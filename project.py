@@ -17,7 +17,7 @@ FOURCC = cv2.VideoWriter_fourcc(*'mp4v')
 
 # --- HSV 顏色範圍 (根據你的調整：黃色) ---
 LOWER_YELLOW = np.array([0, 75, 75])
-UPPER_YELLOW = np.array([179, 255, 255])
+UPPER_YELLOW = np.array([50, 255, 255])
 
 # --- 偵測參數 ---
 MIN_AREA = 1
