@@ -21,7 +21,7 @@ FOURCC = cv2.VideoWriter_fourcc(*'mp4v')
 FPS = 30.0
 DT = 1.0 / FPS  # 時間間隔
 
-LOWER_YELLOW = np.array([0, 75, 75])
+LOWER_YELLOW = np.array([20, 50, 50])
 UPPER_YELLOW = np.array([50, 255, 255])
 MIN_AREA = 1
 MAX_AREA = 1000
@@ -31,6 +31,7 @@ BASE_MAX_DISTANCE = 60      # 基礎匹配距離
 DIST_EXPAND_RATE = 15       # 每熄滅一幀，搜尋半徑擴大 15 像素
 MIN_HITS = 2            
 MAX_SKIPPED_FRAMES = 50 
+MAX_ANGLE_DIFF = np.radians(90)
 
 # ==========================================
 # 2. CTRV 運動模型定義 (給 UKF 使用)
@@ -157,18 +158,42 @@ class Tracker:
 
                 assigned_t, assigned_d = set(), set()
                 for r, c in zip(row, col):
-                    # 動態距離門檻：熄滅越久，找回來的範圍越大
-                    dynamic_max_dist = BASE_MAX_DISTANCE + (self.tracks[r].skipped_frames * DIST_EXPAND_RATE)
+                    # --- 加入角度檢查邏輯 ---
+                    track = self.tracks[r]
+                    det_pos = det_centers[c]
                     
-                    if cost[r, c] < dynamic_max_dist:
-                        self.tracks[r].update(det_centers[c], detections[c][2])
-                        if self.tracks[r].state == 'Confirmed' and self.tracks[r].track_id is None:
-                            self.tracks[r].track_id = self.next_track_id
+                    # 計算位移向量的方向
+                    dx = det_pos[0] - track.ukf.x[0]
+                    dy = det_pos[1] - track.ukf.x[1]
+                    dist = np.sqrt(dx**2 + dy**2)
+                    
+                    angle_ok = True
+                    # 如果位移距離太小 (例如 < 3 像素)，角度計算會不準，跳過檢查
+                    if dist > 3:
+                        move_angle = np.arctan2(dy, dx)
+                        pred_theta = track.ukf.x[3] # UKF 預測的角度
+                        
+                        # 計算角度差並歸一化
+                        angle_err = abs(normalize_angle(move_angle - pred_theta))
+                        
+                        # 如果角度偏差大於 90 度，代表螢火蟲在「倒退飛」或「急轉彎」
+                        if angle_err > MAX_ANGLE_DIFF:
+                            angle_ok = False
+
+                    # 動態距離門檻
+                    dynamic_max_dist = BASE_MAX_DISTANCE + (track.skipped_frames * DIST_EXPAND_RATE)
+                    
+                    # 必須同時滿足「距離」與「角度」條件才配對
+                    if cost[r, c] < dynamic_max_dist and angle_ok:
+                        track.update(det_pos, detections[c][2])
+                        if track.state == 'Confirmed' and track.track_id is None:
+                            track.track_id = self.next_track_id
                             self.next_track_id += 1
                             self.total_unique_count += 1
                         assigned_t.add(r)
                         assigned_d.add(c)
 
+                # 處理未分配的軌跡與偵測點
                 for i, t in enumerate(self.tracks):
                     if i not in assigned_t: t.skipped_frames += 1
                 for i, det in enumerate(detections):
