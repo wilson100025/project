@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 
 # 1. 讀取影像 (注意：不能用 0，必須讀取彩色資訊才能轉 HSV)
-img = cv2.imread(r'D:\project\project\input_images\firefly_2.png', 1)
+img = cv2.imread(r'C:\Users\USER\Desktop\SCHOOL\專題\code\main\input_images\firefly_2.png', 1)
 
 if img is not None:
     # 1. 放大圖片方便觀察
@@ -22,3 +22,4 @@ if img is not None:
 
     cv2.imshow('Zoomed Image', img_large)
     cv2.waitKey(0)
+    cv2.destroyAllWindows()

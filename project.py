@@ -14,13 +14,13 @@ from filterpy.kalman import MerweScaledSigmaPoints
 # ==========================================
 INPUT_DIR = 'input_videos'
 OUTPUT_DIR = 'output_videos'
-VIDEO_EXTENSIONS = ['*.mp4', '*.avi', '*.mov']
+VIDEO_EXTENSIONS = ['*.mp4', '*.avi', '*.mov', '*.MTS']
 FOURCC = cv2.VideoWriter_fourcc(*'mp4v')
 
 # 影像處理參數 (根據你的環境微調)
 LOWER_YELLOW = np.array([20, 50, 50])
 UPPER_YELLOW = np.array([50, 255, 255])
-MIN_AREA = 2
+MIN_AREA = 5
 MAX_AREA = 1000
 
 # 追蹤進階參數
@@ -28,6 +28,9 @@ BASE_MAX_DISTANCE = 60      # 基礎匹配像素距離
 DIST_EXPAND_RATE = 10       # 熄滅時每幀擴張的搜尋半徑
 MAX_SKIPPED_FRAMES = 50     # 容許熄滅的最大幀數
 MAX_ANGLE_DIFF = np.radians(90) # 運動角度偏差門檻
+
+# Toggle UKF prediction logging
+PRINT_PREDICTIONS = True
 
 # ==========================================
 # 2. 運動模型與數學工具
@@ -70,7 +73,8 @@ class FireflyTrack:
         self.skipped_frames = 0
         self.total_active_frames = 1 
         self.state = 'Tentative'
-        
+        self.path = [(int(center[0]), int(center[1]))]
+
         # 儲存色彩數據: (BGR, HSV)
         self.last_bgr = color_data[0]
         self.last_hsv = color_data[1]
@@ -86,10 +90,25 @@ class FireflyTrack:
 
     def predict(self):
         self.ukf.predict()
-        return self.ukf.x[:2]
+        pred = self.ukf.x.copy()
+        if PRINT_PREDICTIONS:
+            track_label = f"{self.track_id:3d}" if self.track_id is not None else "TENT"
+            print(
+                f"[Pred] ID:{track_label} x={pred[0]:7.2f} y={pred[1]:7.2f} "
+                f"v={pred[2]:6.2f} theta={pred[3]:6.2f} omega={pred[4]:6.2f}"
+            )
+        return pred[:2]
 
     def update(self, center, box, color_data):
         self.ukf.update(np.array([float(center[0]), float(center[1])]))
+
+        # --- 新增：即時記錄與印出座標 ---
+        curr_pos = (int(center[0]), int(center[1]))
+        self.path.append(curr_pos)
+        if self.track_id:
+            print(f"[Live] ID:{self.track_id:3d} 座標: {curr_pos}")
+        # ----------------------------
+
         self.box = box
         self.last_bgr = color_data[0]
         self.last_hsv = color_data[1]
@@ -156,8 +175,12 @@ class Tracker:
                (t.state == 'Tentative' and t.skipped_frames > 2):
                 if t.track_id:
                     duration = t.total_active_frames / self.fps
-                    print(f"[Track End] ID:{t.track_id:3d} | 時長:{duration:5.2f}s | "
-                          f"最亮BGR:{t.last_bgr} | HSV:{t.last_hsv}")
+                    print("-" * 30)
+                    print(f"[Track Summary] ID:{t.track_id:3d}")
+                    print(f"時長: {duration:5.2f}s")
+                    print(f"移動軌跡 (x, y): {t.path}") # 印出整段座標清單
+                    print(f"最亮 BGR: {t.last_bgr}")
+                    print("-" * 30)
 
         self.tracks = [t for t in self.tracks if not (
             (t.state == 'Confirmed' and t.skipped_frames > MAX_SKIPPED_FRAMES) or 
