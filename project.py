@@ -114,88 +114,64 @@ class Tracker:
         self.fps = fps
 
     def update(self, detections):
-        """
-        處理每一幀的追蹤邏輯
-        detections: 當前幀 OpenCV 偵測到的所有螢火蟲資料 (dict 列表)
-        """
-        # 1. 預測階段：所有現有軌跡先根據物理模型往後推算一幀
-        for t in self.tracks:
-            t.predict()
+        for t in self.tracks: t.predict()
 
-        # 2. 關聯階段：計算預測位置與實際偵測點的距離矩陣
-        num_tracks = len(self.tracks)
-        num_detections = len(detections)
-        
-        # 建立距離矩陣 (Cost Matrix)
-        cost_matrix = np.zeros((num_tracks, num_detections))
-        for i, t in enumerate(self.tracks):
-            for j, d in enumerate(detections):
-                dist = np.linalg.norm(t.ukf.x[:2] - d['center'])
-                cost_matrix[i, j] = dist
-
-        # 使用匈牙利演算法進行最優匹配
-        from scipy.optimize import linear_sum_assignment
-        row_ind, col_ind = linear_sum_assignment(cost_matrix)
-
-        matched_track_indices = set()
-        matched_det_indices = set()
-
-        # 3. 更新階段
-        # A. 處理成功匹配的軌跡 (螢火蟲亮起中)
-        for t_idx, d_idx in zip(row_ind, col_ind):
-            dist = cost_matrix[t_idx, d_idx]
+        if detections:
+            track_centers = [t.ukf.x[:2] for t in self.tracks]
+            det_centers = [d[:2] for d in detections]
             
-            # 設定門檻：如果距離太遠，就不視為同一隻
-            if dist < (60 + self.tracks[t_idx].skipped_frames * 10):
-                t = self.tracks[t_idx]
-                d = detections[d_idx]
-                
-                # 執行 UKF Update (修正模型)
-                t.update(d['center'], d['box'], (d['brightest_bgr'], d['hsv']))
-                
-                # 印出實測座標 (Live 部分已寫在 FireflyTrack.update 內)
-                matched_track_indices.add(t_idx)
-                matched_det_indices.add(d_idx)
+            if not track_centers:
+                for det in detections: self._add_track(det)
+            else:
+                cost = distance.cdist(track_centers, det_centers)
+                row, col = linear_sum_assignment(cost)
+                assigned_t, assigned_d = set(), set()
 
-        # B. 處理未匹配到的軌跡 (螢火蟲熄滅中)
-        for i, t in enumerate(self.tracks):
-            if i not in matched_track_indices:
-                t.skipped_frames += 1
-                
-                # 只有 Confirmed (確定是螢火蟲) 的才印出預測，避免雜訊洗板
-                if t.state == 'Confirmed' and t.track_id:
-                    pred_x = int(t.ukf.x[0])
-                    pred_y = int(t.ukf.x[1])
+                for r, c in zip(row, col):
+                    track = self.tracks[r]
+                    det_pos = det_centers[c]
                     
-                    # 記錄預測點，並標註為 Predicted
-                    t.path.append((pred_x, pred_y, "Predicted"))
+                    # 計算夾角檢查
+                    dx, dy = det_pos[0] - track.ukf.x[0], det_pos[1] - track.ukf.x[1]
+                    dist = np.sqrt(dx**2 + dy**2)
                     
-                    print(f"[Pred] ID:{t.track_id:3d} 預測座標: ({pred_x:4d}, {pred_y:4d}) (連續缺失 {t.skipped_frames:2d} 幀)")
+                    # 邏輯優化：位移大於 10 像素才檢查角度，避免變暗時的質心震盪導致斷追蹤
+                    angle_ok = True
+                    if dist > 10:
+                        move_angle = np.arctan2(dy, dx)
+                        angle_err = abs(normalize_angle(move_angle - track.ukf.x[3]))
+                        if angle_err > MAX_ANGLE_DIFF: angle_ok = False
 
-        # C. 處理未被分配的偵測點 (新出現的螢火蟲)
-        for j, d in enumerate(detections):
-            if j not in matched_det_indices:
-                new_track = FireflyTrack(self.next_id, d['center'], d['box'], 
-                                        (d['brightest_bgr'], d['hsv']), self.fps)
-                self.tracks.append(new_track)
-                self.next_id += 1
+                    dynamic_dist = BASE_MAX_DISTANCE + (track.skipped_frames * DIST_EXPAND_RATE)
+                    
+                    if cost[r, c] < dynamic_dist and angle_ok:
+                        track.update(det_pos, detections[c][2], detections[c][3])
+                        if track.state == 'Confirmed' and track.track_id is None:
+                            track.track_id = self.next_id
+                            self.next_id += 1
+                        assigned_t.add(r)
+                        assigned_d.add(c)
 
-        # 4. 清理階段：移除消失太久的軌跡
-        # 在移除前，印出 Summary (這部分的 print 邏輯建議放在這裡)
+                for i, t in enumerate(self.tracks):
+                    if i not in assigned_t: t.skipped_frames += 1
+                for i, det in enumerate(detections):
+                    if i not in assigned_d: self._add_track(det)
+        else:
+            for t in self.tracks: t.skipped_frames += 1
+
+        # 在移除死亡 ID 前，印出其完整數據
         for t in self.tracks:
             if (t.state == 'Confirmed' and t.skipped_frames > MAX_SKIPPED_FRAMES) or \
                (t.state == 'Tentative' and t.skipped_frames > 2):
                 if t.track_id:
-                    print("-" * 40)
-                    print(f"[Track Summary] ID: {t.track_id}")
-                    print(f"總路徑點數: {len(t.path)}")
-                    # 分離實測點與預測點來觀察
-                    live_points = [p for p in t.path if len(p) == 2]
-                    print(f"實測座標總數: {len(live_points)}")
-                    print(f"完整路徑: {t.path}")
-                    print("-" * 40)
+                    duration = t.total_active_frames / self.fps
+                    print("-" * 30)
+                    print(f"[Track Summary] ID:{t.track_id:3d}")
+                    print(f"時長: {duration:5.2f}s")
+                    print(f"移動軌跡 (x, y): {t.path}") # 印出整段座標清單
+                    print(f"最亮 BGR: {t.last_bgr}")
+                    print("-" * 30)
 
-        # 執行過濾移除
         self.tracks = [t for t in self.tracks if not (
             (t.state == 'Confirmed' and t.skipped_frames > MAX_SKIPPED_FRAMES) or 
             (t.state == 'Tentative' and t.skipped_frames > 2))]
