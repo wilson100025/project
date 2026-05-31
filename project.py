@@ -2,7 +2,6 @@ import cv2
 import numpy as np
 import os
 import glob
-import time
 from scipy.spatial import distance
 from scipy.optimize import linear_sum_assignment
 
@@ -10,54 +9,34 @@ from scipy.optimize import linear_sum_assignment
 from filterpy.kalman import UnscentedKalmanFilter as UKF
 from filterpy.kalman import MerweScaledSigmaPoints
 
-
-# ==========================================
-# 1. 全域參數與路徑設定
-# ==========================================
 INPUT_DIR = 'input_videos'
 OUTPUT_DIR = 'output_videos'
-VIDEO_EXTENSIONS = ['*.mp4', '*.avi', '*.mov', '*.mkv']
+VIDEO_EXTENSIONS = ['*.mp4', '*.avi', '*.mov', '*.MTS']
 FOURCC = cv2.VideoWriter_fourcc(*'mp4v')
 
-FPS = 30.0
-DT = 1.0 / FPS  # 時間間隔
-
+# HSV 顏色過濾範圍 (黃色/綠色螢光)
 LOWER_YELLOW = np.array([20, 50, 50])
 UPPER_YELLOW = np.array([50, 255, 255])
-MIN_AREA = 1
-MAX_AREA = 1000
+MIN_AREA = 5       # 最小物件面積
+MAX_AREA = 1000   # 最大物件面積
 
-# 追蹤器進階參數
-BASE_MAX_DISTANCE = 60      # 基礎匹配距離
-DIST_EXPAND_RATE = 15       # 每熄滅一幀，搜尋半徑擴大 15 像素
-MIN_HITS = 2            
-MAX_SKIPPED_FRAMES = 50 
-MAX_ANGLE_DIFF = np.radians(90)
+BASE_MAX_DISTANCE = 60      # 基礎匹配像素距離
+DIST_EXPAND_RATE = 10       # 熄滅時每幀擴張的搜尋半徑
+MAX_SKIPPED_FRAMES = 50     # 容許熄滅的最大幀數
+MAX_ANGLE_DIFF = np.radians(90) # 運動角度偏差門檻
 
-# ==========================================
-# 2. CTRV 運動模型定義 (給 UKF 使用)
-# ==========================================
 def normalize_angle(x):
-    """將角度限制在 -pi 到 pi 之間"""
     x = x % (2 * np.pi)
-    if x > np.pi:
-        x -= 2 * np.pi
+    if x > np.pi: x -= 2 * np.pi
     return x
 
 def residual_x(a, b):
-    """計算狀態殘差，特別處理角度相減的問題"""
     y = a - b
     y[3] = normalize_angle(y[3])
     return y
 
 def fx_ctrv(x, dt):
-    """
-    CTRV 模型狀態轉移函數
-    狀態向量 x = [x, y, v, theta, omega]
-    """
     px, py, v, theta, omega = x
-    
-    # 避免除以零 (當角速度極小時，視為直線運動)
     if abs(omega) < 0.001:
         new_x = px + v * np.cos(theta) * dt
         new_y = py + v * np.sin(theta) * dt
@@ -65,153 +44,142 @@ def fx_ctrv(x, dt):
         new_x = px + (v / omega) * (np.sin(theta + omega * dt) - np.sin(theta))
         new_y = py + (v / omega) * (-np.cos(theta + omega * dt) + np.cos(theta))
     
-    # 稍微衰減速度與角速度，模擬螢火蟲熄滅時的「減速慣性」
-    new_v = v * 0.95 
-    new_omega = omega * 0.95
+    new_v = v 
+    new_omega = omega
     new_theta = normalize_angle(theta + omega * dt)
-    
     return np.array([new_x, new_y, new_v, new_theta, new_omega])
 
 def hx_ctrv(x):
-    """測量函數：我們只能從影像中觀測到 (x, y)"""
     return np.array([x[0], x[1]])
 
-# ==========================================
-# 3. UKF 追蹤類別
-# ==========================================
 class FireflyTrack:
-    def __init__(self, track_id, center, box):
+    def __init__(self, track_id, center, box, color_data, fps):
         self.track_id = track_id
-        self.box = box           # (x, y, w, h)
-        self.skipped_frames = 0  
-        self.hits = 1            
+        self.box = box # (x, y, w, h)
+        self.fps = fps
+        self.skipped_frames = 0
+        self.total_active_frames = 1 
         self.state = 'Tentative'
-        self.history = [center]
-
-        # 1. 建立 Sigma Points
-        points = MerweScaledSigmaPoints(n=5, alpha=0.1, beta=2., kappa=0.)
-
-        # 2. 初始化 UKF (狀態 5 維，觀測 2 維)
-        self.ukf = UKF(dim_x=5, dim_z=2, fx=fx_ctrv, hx=hx_ctrv, 
-                       dt=DT, points=points, residual_x=residual_x)
         
-        # 初始狀態: [x, y, v=0, theta=0, omega=0]
+        # 軌跡路徑：記錄 (x, y, 是否為預測點)
+        self.path = [(int(center[0]), int(center[1]), False)]
+
+        # 初始化 UKF (CTRV 模型)
+        points = MerweScaledSigmaPoints(n=5, alpha=0.1, beta=2., kappa=0.)
+        self.ukf = UKF(dim_x=5, dim_z=2, fx=fx_ctrv, hx=hx_ctrv, 
+                       dt=1.0/fps, points=points, residual_x=residual_x)
+        # 狀態區向量 x: [px, py, v, theta, omega]
         self.ukf.x = np.array([float(center[0]), float(center[1]), 0.0, 0.0, 0.0])
         
-        # 初始不確定性 (P矩陣)：給予 v, theta, omega 較大的初始誤差容忍度
-        self.ukf.P = np.diag([10., 10., 50., np.pi, 2.])
-        
-        # 過程雜訊 (Q矩陣)：允許速度和角速度在模型預測中產生變化
-        self.ukf.Q = np.diag([0.1, 0.1, 5.0, 0.5, 0.5])
-        
-        # 測量雜訊 (R矩陣)：觀測值的可信度
+        # 協方差矩陣 P, Q, R 設定
+        self.ukf.P = np.diag([5., 5., 100., np.pi/4, 0.5]) 
+        self.ukf.Q = np.diag([0.5, 0.5, 5.0, 0.01, 0.01])   
         self.ukf.R = np.diag([3.0, 3.0])
 
     def predict(self):
-        # UKF 的強項：無論是否熄滅，都交給模型去推算，P矩陣會自動放大
         self.ukf.predict()
-        return self.ukf.x[:2]
+        return self.ukf.x.copy()[:2]
 
-    def update(self, center, box):
-        current_pos = np.array([float(center[0]), float(center[1])])
-        
-        # 獲得新觀測值，進行狀態更新
-        self.ukf.update(current_pos)
-        
+    def update(self, center, box, color_data):
+        self.ukf.update(np.array([float(center[0]), float(center[1])]))
+
+        # 速度約束：v 必須為正
+        if self.ukf.x[2] < 0:  
+            self.ukf.x[2] = -self.ukf.x[2]  
+            self.ukf.x[3] = self.ukf.x[3] + np.pi  
+            self.ukf.x[3] = np.arctan2(np.sin(self.ukf.x[3]), np.cos(self.ukf.x[3]))
+
+        curr_pos = (int(center[0]), int(center[1]))
+        self.path.append((curr_pos[0], curr_pos[1], False)) # 記錄為真實點
+
         self.box = box
         self.skipped_frames = 0
-        self.hits += 1
-        if self.hits >= MIN_HITS:
+        self.total_active_frames += 1
+        if self.total_active_frames >= 2:
             self.state = 'Confirmed'
-            
-        self.history.append((int(current_pos[0]), int(current_pos[1])))
-        if len(self.history) > 30: 
-            self.history.pop(0)
-
-    def is_dead(self):
-        if self.state == 'Tentative' and self.skipped_frames > 1: return True
-        if self.state == 'Confirmed' and self.skipped_frames > MAX_SKIPPED_FRAMES: return True
-        return False
 
 class Tracker:
-    def __init__(self):
+    def __init__(self, fps):
         self.tracks = []
-        self.next_track_id = 1
-        self.total_unique_count = 0 
+        self.next_id = 1
+        self.fps = fps
 
     def update(self, detections):
-        # 1. 預測所有軌跡
-        for t in self.tracks:
-            t.predict()
+        # 1. 預測
+        for t in self.tracks: t.predict()
 
-        if not detections:
-            for t in self.tracks: t.skipped_frames += 1
-        else:
-            # 2. 匹配偵測點
+        if detections:
             track_centers = [t.ukf.x[:2] for t in self.tracks]
             det_centers = [d[:2] for d in detections]
             
             if not track_centers:
                 for det in detections: self._add_track(det)
             else:
+                # 2. 匈牙利算法配對
                 cost = distance.cdist(track_centers, det_centers)
                 row, col = linear_sum_assignment(cost)
-
                 assigned_t, assigned_d = set(), set()
+
                 for r, c in zip(row, col):
-                    # --- 加入角度檢查邏輯 ---
                     track = self.tracks[r]
                     det_pos = det_centers[c]
                     
-                    # 計算位移向量的方向
-                    dx = det_pos[0] - track.ukf.x[0]
-                    dy = det_pos[1] - track.ukf.x[1]
+                    # 計算運動角度偏差
+                    dx, dy = det_pos[0] - track.ukf.x[0], det_pos[1] - track.ukf.x[1]
                     dist = np.sqrt(dx**2 + dy**2)
                     
                     angle_ok = True
-                    # 如果位移距離太小 (例如 < 3 像素)，角度計算會不準，跳過檢查
-                    if dist > 3:
+                    if dist > 10:
                         move_angle = np.arctan2(dy, dx)
-                        pred_theta = track.ukf.x[3] # UKF 預測的角度
-                        
-                        # 計算角度差並歸一化
-                        angle_err = abs(normalize_angle(move_angle - pred_theta))
-                        
-                        # 如果角度偏差大於 90 度，代表螢火蟲在「倒退飛」或「急轉彎」
-                        if angle_err > MAX_ANGLE_DIFF:
-                            angle_ok = False
+                        angle_err = abs(normalize_angle(move_angle - track.ukf.x[3]))
+                        if angle_err > MAX_ANGLE_DIFF: angle_ok = False
 
-                    # 動態距離門檻
-                    dynamic_max_dist = BASE_MAX_DISTANCE + (track.skipped_frames * DIST_EXPAND_RATE)
+                    # 動態搜尋半徑
+                    dynamic_dist = BASE_MAX_DISTANCE + (track.skipped_frames * DIST_EXPAND_RATE)
                     
-                    # 必須同時滿足「距離」與「角度」條件才配對
-                    if cost[r, c] < dynamic_max_dist and angle_ok:
-                        track.update(det_pos, detections[c][2])
+                    # 門檻驗證（距離 + 角度）
+                    if cost[r, c] < dynamic_dist and angle_ok:
+                        track.update(det_pos, detections[c][2], detections[c][3])
                         if track.state == 'Confirmed' and track.track_id is None:
-                            track.track_id = self.next_track_id
-                            self.next_track_id += 1
-                            self.total_unique_count += 1
+                            track.track_id = self.next_id
+                            self.next_id += 1
                         assigned_t.add(r)
                         assigned_d.add(c)
 
-                # 處理未分配的軌跡與偵測點
+                # 3. 處理未配對的 Track (進入盲推)
                 for i, t in enumerate(self.tracks):
-                    if i not in assigned_t: t.skipped_frames += 1
+                    if i not in assigned_t: 
+                        t.skipped_frames += 1
+                        # 軌跡記錄預測位置
+                        t.path.append((int(t.ukf.x[0]), int(t.ukf.x[1]), True)) 
+                        
+                # 4. 處理未配對的 Detection (新增 Track)
                 for i, det in enumerate(detections):
                     if i not in assigned_d: self._add_track(det)
+        else:
+            # 無偵測點，所有 Track 進入盲推
+            for t in self.tracks: 
+                t.skipped_frames += 1
+                t.path.append((int(t.ukf.x[0]), int(t.ukf.x[1]), True))
 
-        self.tracks = [t for t in self.tracks if not t.is_dead()]
+        # 5. 移除過期或無效的 Track
+        self.tracks = [t for t in self.tracks if not (
+            (t.state == 'Confirmed' and t.skipped_frames > MAX_SKIPPED_FRAMES) or 
+            (t.state == 'Tentative' and t.skipped_frames > 2))]
 
     def _add_track(self, det):
-        self.tracks.append(FireflyTrack(None, det[:2], det[2]))
+        # 初始 ID 為 None，直到 Confirmed
+        self.tracks.append(FireflyTrack(None, det[:2], det[2], det[3], self.fps))
 
-# ==========================================
-# 4. 影像處理與主程式 (保持與原版大致相同)
-# ==========================================
-def get_detections_hsv(frame):
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    blurred = cv2.GaussianBlur(hsv, (3, 3), 0)
-    mask = cv2.inRange(blurred, LOWER_YELLOW, UPPER_YELLOW)
+def get_detections_with_color(frame):
+    # 影像處理獲取偵測點
+    hsv_full = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    # 高斯模糊減少雜訊
+    blurred_hsv = cv2.GaussianBlur(hsv_full, (3, 3), 0)
+    mask = cv2.inRange(blurred_hsv, LOWER_YELLOW, UPPER_YELLOW)
+    
+    # 形態學閉運算連接斷點
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8))
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     dets = []
@@ -219,58 +187,84 @@ def get_detections_hsv(frame):
         area = cv2.contourArea(cnt)
         if MIN_AREA < area < MAX_AREA:
             x, y, w, h = cv2.boundingRect(cnt)
-            dets.append((x + w//2, y + h//2, (x, y, w, h)))
+            # 計算中心點與獲取亮度和顏色數據（保留格式以相容 update 函數）
+            dets.append((x + w//2, y + h//2, (x, y, w, h), (None, None)))
     return dets
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    video_paths = glob.glob(os.path.join(INPUT_DIR, "*.mp4"))
+    video_files = []
+    for ext in VIDEO_EXTENSIONS:
+        video_files.extend(glob.glob(os.path.join(INPUT_DIR, ext)))
 
-    for path in video_paths:
-        filename = os.path.basename(path)
+    if not video_files:
+        print(f"找不到影片檔案於: {INPUT_DIR}")
+        return
+
+    for path in video_files:
         cap = cv2.VideoCapture(path)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0 # 防呆機制，若讀不到 fps 預設給 30
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        w, h = int(cap.get(cv2.CAP_PROP_FPS)), int(cap.get(4)) # 修正 grabbed size bug
         w, h = int(cap.get(3)), int(cap.get(4))
-        out = cv2.VideoWriter(os.path.join(OUTPUT_DIR, f'UKF_TRACK_{filename}'), FOURCC, fps, (w, h))
         
-        tracker = Tracker()
+        output_path = os.path.join(OUTPUT_DIR, f'RESULT_{os.path.basename(path)}')
+        out = cv2.VideoWriter(output_path, FOURCC, fps, (w, h))
+        
+        tracker = Tracker(fps)
         f_idx = 0
+        print(f"\n--- 開始處理影片: {os.path.basename(path)} ---")
 
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret: break
             f_idx += 1
 
-            dets = get_detections_hsv(frame)
+            dets = get_detections_with_color(frame)
             tracker.update(dets)
 
-            output_frame = frame.copy()
+            # 視覺化繪製：軌跡、外框與 ID
             for t in tracker.tracks:
                 if t.state == 'Confirmed':
-                    # 依據 UKF 預測狀態繪製框
-                    curr_x, curr_y = int(t.ukf.x[0]), int(t.ukf.x[1])
-                    bw, bh = t.box[2], t.box[3]
-                    
-                    color = (0, 255, 0) if t.skipped_frames == 0 else (0, 165, 255) # 熄滅時畫橘色
-                    
-                    cv2.rectangle(output_frame, (curr_x - bw//2, curr_y - bh//2), 
-                                  (curr_x + bw//2, curr_y + bh//2), color, 2)
-                    cv2.putText(output_frame, f"ID:{t.track_id}", (curr_x - bw//2, curr_y - bh//2 - 5), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                    
-                    # (可選) 畫出歷史軌跡
-                    for i in range(1, len(t.history)):
-                        cv2.line(output_frame, t.history[i-1], t.history[i], color, 1)
+                    # A. 繪製歷史軌跡線條
+                    for i in range(1, len(t.path)):
+                        pt1 = t.path[i-1][:2]
+                        pt2 = t.path[i][:2]
+                        is_pred = t.path[i][2]
+                        
+                        # 真實偵測為綠線，盲推預測為橘線
+                        line_color = (0, 165, 255) if is_pred else (0, 255, 0)
+                        cv2.line(frame, pt1, pt2, line_color, 2, cv2.LINE_AA)
 
-            cv2.putText(output_frame, f"Fireflies: {tracker.total_unique_count}", 
-                        (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            
-            out.write(output_frame)
-            if f_idx % 30 == 0: print(f"Processing {filename}: Frame {f_idx}")
+                    # B. 繪製當前外框與 ID
+                    # 獲取 UKF 估計的當前中心位置
+                    cx, cy = int(t.ukf.x[0]), int(t.ukf.x[1])
+                    # 獲取最後一次偵測到的框大小 (w, h)
+                    _, _, bw, bh = t.box
+                    
+                    is_predicting = t.skipped_frames > 0
+                    
+                    # 根據狀態切換顏色與文字
+                    if is_predicting:
+                        color = (0, 165, 255) # 預測狀態用橘色
+                        text = f"ID:{t.track_id} (Loss)"
+                    else:
+                        color = (0, 255, 0) # 正常追蹤用綠色
+                        text = f"ID:{t.track_id}"
+                    
+                    # 繪製方框 (計算左上角與右下角)
+                    cv2.rectangle(frame, (cx - bw//2, cy - bh//2), 
+                                  (cx + bw//2, cy + bh//2), color, 2)
+                    
+                    # 繪製 ID 文字
+                    cv2.putText(frame, text, (cx - bw//2, cy - bh//2 - 5), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+            out.write(frame)
+            if f_idx % 60 == 0: print(f"進度: Frame {f_idx}")
 
         cap.release()
         out.release()
-        print(f"Done: {filename} | Total Unique Fireflies: {tracker.total_unique_count}")
+        print(f"--- 影片處理完成: {os.path.basename(path)} ---")
 
 if __name__ == "__main__":
     main()
