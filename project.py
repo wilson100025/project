@@ -1,7 +1,10 @@
+import argparse
+import json
 import cv2
 import numpy as np
 import os
 import glob
+from typing import List, Optional
 from scipy.spatial import distance
 from scipy.optimize import linear_sum_assignment
 
@@ -122,6 +125,26 @@ class Tracker:
         self.tracks = []
         self.next_id = 1
         self.fps = fps
+        self.summaries: List[dict] = []
+        self._summarized_ids = set()
+
+    def _summarize_track(self, track) -> None:
+        if track.track_id is None or track.track_id in self._summarized_ids:
+            return
+        duration = track.total_active_frames / self.fps
+        path = [[int(x), int(y)] for x, y in track.path]
+        brightest = None
+        if track.last_bgr is not None:
+            brightest = [int(v) for v in track.last_bgr]
+        self.summaries.append(
+            {
+                "track_id": int(track.track_id),
+                "duration_s": float(duration),
+                "path": path,
+                "brightest_bgr": brightest,
+            }
+        )
+        self._summarized_ids.add(track.track_id)
 
     def update(self, detections):
         for t in self.tracks: t.predict()
@@ -173,6 +196,7 @@ class Tracker:
         for t in self.tracks:
             if (t.state == 'Confirmed' and t.skipped_frames > MAX_SKIPPED_FRAMES) or \
                (t.state == 'Tentative' and t.skipped_frames > 2):
+                self._summarize_track(t)
                 if t.track_id:
                     duration = t.total_active_frames / self.fps
                     print("-" * 30)
@@ -185,6 +209,11 @@ class Tracker:
         self.tracks = [t for t in self.tracks if not (
             (t.state == 'Confirmed' and t.skipped_frames > MAX_SKIPPED_FRAMES) or 
             (t.state == 'Tentative' and t.skipped_frames > 2))]
+
+    def finalize(self) -> None:
+        for track in self.tracks:
+            if track.state == 'Confirmed':
+                self._summarize_track(track)
 
     def _add_track(self, det):
         self.tracks.append(FireflyTrack(None, det[:2], det[2], det[3], self.fps))
@@ -215,46 +244,89 @@ def get_detections_with_color(frame):
             dets.append((x + w//2, y + h//2, (x, y, w, h), (brightest_bgr, brightest_hsv)))
     return dets
 
+def _write_firefly_json(path: str, records: List[dict]) -> None:
+    folder = os.path.dirname(path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(records, handle, ensure_ascii=False, indent=2)
+
+
+def process_video(input_path: str, output_path: Optional[str], json_path: Optional[str]) -> int:
+    if not os.path.isfile(input_path):
+        print(f"找不到影片: {input_path}")
+        return 1
+
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        print(f"無法開啟影片: {input_path}")
+        return 1
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    w, h = int(cap.get(3)), int(cap.get(4))
+    if output_path is None:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        output_path = os.path.join(OUTPUT_DIR, f'RESULT_{os.path.basename(input_path)}')
+    else:
+        folder = os.path.dirname(output_path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+
+    out = cv2.VideoWriter(output_path, FOURCC, fps, (w, h))
+    tracker = Tracker(fps)
+    f_idx = 0
+    print(f"\n--- 開始處理影片: {os.path.basename(input_path)} ---")
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        f_idx += 1
+
+        dets = get_detections_with_color(frame)
+        tracker.update(dets)
+
+        for t in tracker.tracks:
+            if t.state == 'Confirmed':
+                cx, cy = int(t.ukf.x[0]), int(t.ukf.x[1])
+                bx, by, bw, bh = t.box
+                color = (0, 255, 0) if t.skipped_frames == 0 else (0, 165, 255)
+                cv2.rectangle(frame, (cx-bw//2, cy-bh//2), (cx+bw//2, cy+bh//2), color, 2)
+                cv2.putText(frame, f"ID:{t.track_id}", (cx-bw//2, cy-bh//2-5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+        out.write(frame)
+        if f_idx % 60 == 0:
+            print(f"進度: Frame {f_idx}")
+
+    tracker.finalize()
+    if json_path:
+        _write_firefly_json(json_path, tracker.summaries)
+
+    cap.release()
+    out.release()
+    print(f"--- 影片處理完成: {os.path.basename(input_path)} ---")
+    return 0
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Firefly tracking")
+    parser.add_argument("-i", "--input", dest="input_path", help="input video path")
+    parser.add_argument("-o", "--output", dest="output_path", help="output video path")
+    parser.add_argument("-j", "--json", dest="json_path", help="output json path")
+    args = parser.parse_args()
+
+    if args.input_path:
+        raise SystemExit(process_video(args.input_path, args.output_path, args.json_path))
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     video_files = []
     for ext in VIDEO_EXTENSIONS:
         video_files.extend(glob.glob(os.path.join(INPUT_DIR, ext)))
 
     for path in video_files:
-        cap = cv2.VideoCapture(path)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        w, h = int(cap.get(3)), int(cap.get(4))
-        out = cv2.VideoWriter(os.path.join(OUTPUT_DIR, f'RESULT_{os.path.basename(path)}'), 
-                              FOURCC, fps, (w, h))
-        
-        tracker = Tracker(fps)
-        f_idx = 0
-        print(f"\n--- 開始處理影片: {os.path.basename(path)} ---")
-
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret: break
-            f_idx += 1
-
-            dets = get_detections_with_color(frame)
-            tracker.update(dets)
-
-            for t in tracker.tracks:
-                if t.state == 'Confirmed':
-                    cx, cy = int(t.ukf.x[0]), int(t.ukf.x[1])
-                    bx, by, bw, bh = t.box
-                    color = (0, 255, 0) if t.skipped_frames == 0 else (0, 165, 255)
-                    cv2.rectangle(frame, (cx-bw//2, cy-bh//2), (cx+bw//2, cy+bh//2), color, 2)
-                    cv2.putText(frame, f"ID:{t.track_id}", (cx-bw//2, cy-bh//2-5), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-            out.write(frame)
-            if f_idx % 60 == 0: print(f"進度: Frame {f_idx}")
-
-        cap.release()
-        out.release()
-        print(f"--- 影片處理完成: {os.path.basename(path)} ---")
+        output_path = os.path.join(OUTPUT_DIR, f'RESULT_{os.path.basename(path)}')
+        process_video(path, output_path, None)
 
 if __name__ == "__main__":
     main()
