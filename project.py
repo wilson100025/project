@@ -14,16 +14,25 @@ OUTPUT_DIR = 'output_videos'
 VIDEO_EXTENSIONS = ['*.mp4', '*.avi', '*.mov', '*.MTS']
 FOURCC = cv2.VideoWriter_fourcc(*'mp4v')
 
-# HSV 顏色過濾範圍 (黃色/綠色螢光)
+# ================= 參數設定區 =================
+# 1. 螢火蟲偵測參數 (HSV 黃/綠色螢光)
 LOWER_YELLOW = np.array([20, 50, 50])
 UPPER_YELLOW = np.array([50, 255, 255])
 MIN_AREA = 5       # 最小物件面積
-MAX_AREA = 1000   # 最大物件面積
+MAX_AREA = 1000    # 最大物件面積
 
+# 2. 靜態干擾綠斑偵測參數 (暗綠色/微光雜訊)
+NOISE_LOWER_GREEN = np.array([35, 20, 20])
+NOISE_UPPER_GREEN = np.array([85, 255, 200])
+NOISE_MIN_AREA = 1600
+
+# 3. 追蹤器參數
 BASE_MAX_DISTANCE = 60      # 基礎匹配像素距離
 DIST_EXPAND_RATE = 10       # 熄滅時每幀擴張的搜尋半徑
 MAX_SKIPPED_FRAMES = 50     # 容許熄滅的最大幀數
 MAX_ANGLE_DIFF = np.radians(90) # 運動角度偏差門檻
+# ==============================================
+
 
 def normalize_angle(x):
     x = x % (2 * np.pi)
@@ -51,6 +60,7 @@ def fx_ctrv(x, dt):
 
 def hx_ctrv(x):
     return np.array([x[0], x[1]])
+
 
 class FireflyTrack:
     def __init__(self, track_id, center, box, color_data, fps):
@@ -97,6 +107,7 @@ class FireflyTrack:
         self.total_active_frames += 1
         if self.total_active_frames >= 2:
             self.state = 'Confirmed'
+
 
 class Tracker:
     def __init__(self, fps):
@@ -168,8 +179,68 @@ class Tracker:
             (t.state == 'Tentative' and t.skipped_frames > 2))]
 
     def _add_track(self, det):
-        # 初始 ID 為 None，直到 Confirmed
         self.tracks.append(FireflyTrack(None, det[:2], det[2], det[3], self.fps))
+
+
+# ================= 靜態遮罩自動生成模組 =================
+def auto_generate_hsv_static_mask(cap, num_frames=30):
+    """
+    透過多幀平均與 HSV 顏色過濾，自動偵測並生成靜態干擾區的遮罩
+    """
+    print(f"正在分析前 {num_frames} 幀以自動建立靜態干擾遮罩...")
+    
+    # 確保影片回到開頭
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    
+    frames = []
+    for _ in range(num_frames):
+        ret, frame = cap.read()
+        if not ret: break
+        frames.append(frame)
+        
+    if not frames: return None
+
+    # 1. 疊加計算平均值，過濾掉移動中的螢火蟲
+    avg_frame = np.mean(frames, axis=0).astype(np.uint8)
+    
+    # 2. 轉換至 HSV 並抓取指定顏色的綠斑
+    hsv_frame = cv2.cvtColor(avg_frame, cv2.COLOR_BGR2HSV)
+    color_mask = cv2.inRange(hsv_frame, NOISE_LOWER_GREEN, NOISE_UPPER_GREEN)
+    
+    # 3. 形態學膨脹讓區塊完整
+    kernel = np.ones((15, 15), np.uint8)
+    dilated = cv2.dilate(color_mask, kernel, iterations=2)
+    
+    # 4. 尋找輪廓
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # 修正維度解包問題，只取前兩個值 (h, w)
+    h, w = avg_frame.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    mask_created = False
+    
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area > NOISE_MIN_AREA:
+            x, y, box_w, box_h = cv2.boundingRect(cnt)
+            # 向外擴展 15 像素緩衝區
+            pad = 15
+            x1, y1 = max(0, x - pad), max(0, y - pad)
+            x2, y2 = min(w, x + box_w + pad), min(h, y + box_h + pad)
+            
+            cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+            print(f"[*] 自動偵測到靜態綠斑! 座標:({x1}, {y1}) 面積:{int(area)}")
+            mask_created = True
+            
+    if not mask_created:
+        print("[*] 畫面乾淨，未偵測到靜態綠斑干擾。")
+
+    # 分析完畢，將影片倒帶回第 0 幀，供主迴圈使用
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    
+    return mask if mask_created else None
+# ======================================================
+
 
 def get_detections_with_color(frame):
     # 影像處理獲取偵測點
@@ -187,9 +258,9 @@ def get_detections_with_color(frame):
         area = cv2.contourArea(cnt)
         if MIN_AREA < area < MAX_AREA:
             x, y, w, h = cv2.boundingRect(cnt)
-            # 計算中心點與獲取亮度和顏色數據（保留格式以相容 update 函數）
             dets.append((x + w//2, y + h//2, (x, y, w, h), (None, None)))
     return dets
+
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -203,8 +274,12 @@ def main():
 
     for path in video_files:
         cap = cv2.VideoCapture(path)
+        
+        # 🌟 【新加入】在開始處理前，全自動生成遮罩 🌟
+        interference_mask = auto_generate_hsv_static_mask(cap, num_frames=30)
+        
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        w, h = int(cap.get(cv2.CAP_PROP_FPS)), int(cap.get(4)) # 修正 grabbed size bug
+        # 取得影片寬高 (使用標準屬性代碼 3 和 4)
         w, h = int(cap.get(3)), int(cap.get(4))
         
         output_path = os.path.join(OUTPUT_DIR, f'RESULT_{os.path.basename(path)}')
@@ -218,6 +293,11 @@ def main():
             ret, frame = cap.read()
             if not ret: break
             f_idx += 1
+
+            # 🌟 【新加入】如果這部影片有生成遮罩，就在偵測前把它塗黑 🌟
+            if interference_mask is not None:
+                # 遮罩為白色的地方 (255)，在原圖上被替換成黑色 (0, 0, 0)
+                frame[interference_mask == 255] = (0, 0, 0)
 
             dets = get_detections_with_color(frame)
             tracker.update(dets)
@@ -236,26 +316,19 @@ def main():
                         cv2.line(frame, pt1, pt2, line_color, 2, cv2.LINE_AA)
 
                     # B. 繪製當前外框與 ID
-                    # 獲取 UKF 估計的當前中心位置
                     cx, cy = int(t.ukf.x[0]), int(t.ukf.x[1])
-                    # 獲取最後一次偵測到的框大小 (w, h)
                     _, _, bw, bh = t.box
-                    
                     is_predicting = t.skipped_frames > 0
                     
-                    # 根據狀態切換顏色與文字
                     if is_predicting:
-                        color = (0, 165, 255) # 預測狀態用橘色
+                        color = (0, 165, 255)
                         text = f"ID:{t.track_id} (Loss)"
                     else:
-                        color = (0, 255, 0) # 正常追蹤用綠色
+                        color = (0, 255, 0)
                         text = f"ID:{t.track_id}"
                     
-                    # 繪製方框 (計算左上角與右下角)
                     cv2.rectangle(frame, (cx - bw//2, cy - bh//2), 
                                   (cx + bw//2, cy + bh//2), color, 2)
-                    
-                    # 繪製 ID 文字
                     cv2.putText(frame, text, (cx - bw//2, cy - bh//2 - 5), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
