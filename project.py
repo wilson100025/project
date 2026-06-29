@@ -9,31 +9,46 @@ from typing import List, Optional
 from scipy.spatial import distance
 from scipy.optimize import linear_sum_assignment
 
+#匯入UKF相關套件
 from filterpy.kalman import UnscentedKalmanFilter as UKF
 from filterpy.kalman import MerweScaledSigmaPoints
 
+
+#初始化基礎目錄（支持 PyInstaller exe）
 def get_base_dir():
+    """
+    在 PyInstaller 打包的 exe 中，返回 exe 所在目錄
+    在開發環境中，返回此腳本所在目錄
+    """
     if getattr(sys, 'frozen', False):
+        # PyInstaller 打包的 exe 環境
         return os.path.dirname(sys.executable)
     else:
+        # 開發環境
         return os.path.dirname(os.path.abspath(__file__))
 
 BASE_DIR = get_base_dir()
+
+
+#1.全域參數設定
 
 INPUT_DIR = os.path.join(BASE_DIR, 'input_videos')
 OUTPUT_DIR = os.path.join(BASE_DIR, 'output_videos')
 VIDEO_EXTENSIONS = ['*.mp4', '*.avi', '*.mov', '*.MTS']
 FOURCC = cv2.VideoWriter_fourcc(*'mp4v')
 
+#影像處理參數
 LOWER_YELLOW = np.array([20, 50, 50])
 UPPER_YELLOW = np.array([50, 255, 255])
 MIN_AREA = 5       #最小物件面積
 MAX_AREA = 1000    #最大物件面積
 
-NOISE_LOWER_GREEN = np.array([35, 20, 20])
-NOISE_UPPER_GREEN = np.array([85, 255, 200])
-NOISE_MIN_AREA = 1600
+#靜態干擾遮罩參數（天空綠斑過濾）
+NOISE_LOWER_GREEN = np.array([35, 20, 20])    # HSV下界
+NOISE_UPPER_GREEN = np.array([85, 255, 200])  # HSV上界
+NOISE_MIN_AREA = 1600    # 最小檢測面積
 
+#追蹤進階參數
 BASE_MAX_DISTANCE = 60          #匹配像素距離
 DIST_EXPAND_RATE = 10           #熄滅時每幀擴張的搜尋半徑
 MAX_SKIPPED_FRAMES = 50         #容許熄滅的最大幀數
@@ -42,6 +57,8 @@ MAX_ANGLE_DIFF = np.radians(90) #運動角度偏差門檻
 
 PRINT_PREDICTIONS = True        #是否開啟UKF預測數據印出
 
+
+#2.運動模型與數學工具
 def normalize_angle(x):
     x = x % (2 * np.pi)
     if x > np.pi: x -= 2 * np.pi
@@ -69,6 +86,9 @@ def fx_ctrv(x, dt):
 def hx_ctrv(x):
     return np.array([x[0], x[1]])
 
+
+#3.核心追蹤類別
+
 class FireflyTrack:
     def __init__(self, track_id, center, box, color_data, fps):
         self.track_id = track_id
@@ -80,9 +100,11 @@ class FireflyTrack:
         
         self.path = [(int(center[0]), int(center[1]), False)]
 
+        # 儲存色彩數據: (BGR, HSV)
         self.last_bgr = color_data[0]
         self.last_hsv = color_data[1]
 
+        # 初始化 UKF
         points = MerweScaledSigmaPoints(n=5, alpha=0.1, beta=2., kappa=0.)
         self.ukf = UKF(dim_x=5, dim_z=2, fx=fx_ctrv, hx=hx_ctrv, 
                        dt=1.0/fps, points=points, residual_x=residual_x)
@@ -116,7 +138,7 @@ class FireflyTrack:
         
         if self.track_id:
             print(f"[Live] ID:{self.track_id:3d} 座標: {curr_pos}")
-
+        
         self.box = box
         self.last_bgr = color_data[0]
         self.last_hsv = color_data[1]
@@ -172,9 +194,11 @@ class Tracker:
                     track = self.tracks[r]
                     det_pos = det_centers[c]
                     
+                    #計算夾角檢查
                     dx, dy = det_pos[0] - track.ukf.x[0], det_pos[1] - track.ukf.x[1]
                     dist = np.sqrt(dx**2 + dy**2)
                     
+                    #位移大於10像素才檢查角度
                     angle_ok = True
                     if dist > 10:
                         move_angle = np.arctan2(dy, dx)
@@ -197,7 +221,7 @@ class Tracker:
                         t.skipped_frames += 1
                         t.path.append((int(t.ukf.x[0]), int(t.ukf.x[1]), True)) 
                         
-                # 4. 未配對的 Detection 新增 Track
+                #未配對的Detection新增Track
                 for i, det in enumerate(detections):
                     if i not in assigned_d: self._add_track(det)
         else:
@@ -233,8 +257,11 @@ class Tracker:
     def _add_track(self, det):
         self.tracks.append(FireflyTrack(None, det[:2], det[2], det[3], self.fps))
 
+#4.影像處理與主程式
 def auto_generate_hsv_static_mask(cap, num_frames=30):
     print(f"正在分析前 {num_frames} 幀以自動建立靜態干擾遮罩...")
+    
+    #確保影片回到開頭
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     
     frames = []
@@ -245,14 +272,21 @@ def auto_generate_hsv_static_mask(cap, num_frames=30):
         
     if not frames: return None
 
+    #疊加計算平均值，過濾掉移動中的螢火蟲
     avg_frame = np.mean(frames, axis=0).astype(np.uint8)
+    
+    #轉換至HSV並抓取指定顏色的綠斑
     hsv_frame = cv2.cvtColor(avg_frame, cv2.COLOR_BGR2HSV)
     color_mask = cv2.inRange(hsv_frame, NOISE_LOWER_GREEN, NOISE_UPPER_GREEN)
     
+    #形態學膨脹讓區塊完整
     kernel = np.ones((15, 15), np.uint8)
     dilated = cv2.dilate(color_mask, kernel, iterations=2)
+    
+    #尋找輪廓
     contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
+    #修正維度解包問題，只取前兩個值(h, w)
     h, w = avg_frame.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
     mask_created = False
@@ -261,6 +295,8 @@ def auto_generate_hsv_static_mask(cap, num_frames=30):
         area = cv2.contourArea(cnt)
         if area > NOISE_MIN_AREA:
             x, y, box_w, box_h = cv2.boundingRect(cnt)
+            
+            #向外擴展15像素緩衝區
             pad = 15
             x1, y1 = max(0, x - pad), max(0, y - pad)
             x2, y2 = min(w, x + box_w + pad), min(h, y + box_h + pad)
@@ -272,15 +308,20 @@ def auto_generate_hsv_static_mask(cap, num_frames=30):
     if not mask_created:
         print("[*] 畫面乾淨，未偵測到靜態綠斑干擾。")
 
+    #分析完畢，將影片倒帶回第0幀，供主迴圈使用
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     return mask if mask_created else None
 
 def get_detections_with_color(frame, static_mask=None):
+    
+    #如果提供了靜態遮罩，先應用遮罩排除干擾區
     if static_mask is not None:
         frame = cv2.bitwise_and(frame, frame, mask=cv2.bitwise_not(static_mask))
     
     hsv_full = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(cv2.GaussianBlur(hsv_full, (3, 3), 0), LOWER_YELLOW, UPPER_YELLOW)
+    
+    #形態學閉運算，防止變暗時光點碎裂
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8))
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
@@ -289,6 +330,8 @@ def get_detections_with_color(frame, static_mask=None):
         area = cv2.contourArea(cnt)
         if MIN_AREA < area < MAX_AREA:
             x, y, w, h = cv2.boundingRect(cnt)
+            
+            #提取ROI最亮點數據
             roi_hsv = hsv_full[y:y+h, x:x+w]
             roi_bgr = frame[y:y+h, x:x+w]
             _, _, _, max_loc = cv2.minMaxLoc(roi_hsv[:, :, 2])
@@ -310,10 +353,12 @@ def process_video(input_path: str, output_path: Optional[str], json_path: Option
         print(f"找不到影片: {input_path}")
         return 1
 
+    #確保路徑是絕對路徑
     input_path = os.path.abspath(input_path)
     if output_path: output_path = os.path.abspath(output_path)
     if json_path: json_path = os.path.abspath(json_path)
 
+    #診斷日誌
     print(f"\n[診斷] process_video 收到的參數:")
     print(f"  input_path (絕對): {input_path}")
     print(f"  output_path (絕對): {output_path}")
@@ -332,7 +377,12 @@ def process_video(input_path: str, output_path: Optional[str], json_path: Option
         output_path = os.path.join(OUTPUT_DIR, f'RESULT_{os.path.basename(input_path)}')
     else:
         folder = os.path.dirname(output_path)
-        if folder: os.makedirs(folder, exist_ok=True)
+        if folder: 
+            os.makedirs(folder, exist_ok=True)
+            print(f"[✓] 已創建輸出資料夾: {folder}")
+            
+    print(f"[診斷] 最終 output_path (絕對): {output_path}")
+    print(f"[診斷] 最終 json_path (絕對): {json_path}")
 
     out = cv2.VideoWriter(output_path, FOURCC, fps, (w, h))
     if not out.isOpened():
@@ -396,11 +446,17 @@ def process_video(input_path: str, output_path: Optional[str], json_path: Option
     cap.release()
     out.release()
     
+    #驗證文件是否已寫入
     if os.path.isfile(output_path):
         print(f"[✓] output 文件已寫入: {output_path} (大小: {os.path.getsize(output_path)} bytes)")
+    else:
+        print(f"[警告] output 文件未找到: {output_path}")
+        
     if json_path and os.path.isfile(json_path):
         print(f"[✓] json 文件已寫入: {json_path} (大小: {os.path.getsize(json_path)} bytes)")
-    
+    else:
+        print(f"[警告] json 文件未找到: {json_path}")
+
     print(f"--- 影片處理完成: {os.path.basename(input_path)} ---")
     return 0
 
